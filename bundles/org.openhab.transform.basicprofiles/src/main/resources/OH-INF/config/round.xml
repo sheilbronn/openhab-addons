@@ -11,7 +11,7 @@
 		</parameter>
 		<parameter name="scale" type="integer" min="-16" max="16" step="1" required="true">
 			<label>Scale</label>
-			<description>For numeric types: number of decimal places (negative values round to tens, hundreds, etc.). For DateTimeType: -1 truncates to start of week (locale-dependent), -2 to start of month, -3 to start of year.</description>
+			<description>Scale to indicate the resulting number of decimal places.</description>
 		</parameter>
 		<parameter name="mode" type="text">
 			<label>Rounding Mode</label>

@@ -17,15 +17,9 @@ import static org.openhab.transform.basicprofiles.internal.factory.BasicProfiles
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.temporal.ChronoUnit;
-import java.time.temporal.WeekFields;
-import java.util.Locale;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
-import org.openhab.core.library.types.DateTimeType;
 import org.openhab.core.library.types.DecimalType;
 import org.openhab.core.library.types.QuantityType;
 import org.openhab.core.thing.profiles.ProfileCallback;
@@ -42,19 +36,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Applies rounding with the specified scale and the rounding mode to a {@link QuantityType}, {@link DecimalType}, or
- * {@link DateTimeType} state. Default rounding mode is {@link RoundingMode#HALF_UP}.
- * <p>
- * For numeric types, the scale indicates the number of decimal places (negative values round to tens, hundreds, etc.).
- * <p>
- * For {@link DateTimeType}, negative scale values truncate to calendar boundaries:
- * <ul>
- * <li>{@code scale = -1}: truncate to the start of the week (locale-dependent first day)</li>
- * <li>{@code scale = -2}: truncate to the first day of the month</li>
- * <li>{@code scale = -3}: truncate to the first day of the year</li>
- * </ul>
- * With rounding mode {@link RoundingMode#CEILING} or {@link RoundingMode#UP}, the result is rounded up to the start
- * of the next calendar period (unless the input is already exactly at the boundary).
+ * Applies rounding with the specified scale and the rounding mode to a {@link QuantityType} or {@link DecimalType}
+ * state. Default rounding mode is {@link RoundingMode#HALF_UP}.
  *
  * @author Christoph Weitkamp - Initial contribution
  */
@@ -150,15 +133,7 @@ public class RoundStateProfile implements TimeSeriesProfile {
             return state;
         }
 
-        if (state instanceof DateTimeType dtState) {
-            if (scale != null && scale.intValue() < 0) {
-                return roundDateTime(dtState);
-            } else {
-                logger.warn(
-                        "Round requires a negative scale for DateTimeType state '{}'. Returning original state.", state);
-                return state;
-            }
-        } else if (state instanceof QuantityType<?> qtState) {
+        if (state instanceof QuantityType<?> qtState) {
             BigDecimal rounded = roundNumber(qtState.toBigDecimal());
             return new QuantityType<>(rounded, qtState.getUnit());
         } else if (state instanceof DecimalType dtState) {
@@ -170,40 +145,6 @@ public class RoundStateProfile implements TimeSeriesProfile {
                     state);
             return state;
         }
-    }
-
-    private DateTimeType roundDateTime(DateTimeType state) {
-        final int scaleValue = scale != null ? scale.intValue() : 0;
-        ZonedDateTime zdt = state.getZonedDateTime(ZoneId.systemDefault());
-        boolean ceiling = roundingMode == RoundingMode.CEILING || roundingMode == RoundingMode.UP;
-        ZonedDateTime result;
-        switch (scaleValue) {
-            case -1: {
-                // truncate to start of week (locale-dependent)
-                WeekFields weekFields = WeekFields.of(Locale.getDefault());
-                ZonedDateTime startOfWeek = zdt.with(weekFields.dayOfWeek(), 1).truncatedTo(ChronoUnit.DAYS);
-                result = ceiling && !zdt.equals(startOfWeek) ? startOfWeek.plusWeeks(1) : startOfWeek;
-                break;
-            }
-            case -2: {
-                // truncate to start of month
-                ZonedDateTime startOfMonth = zdt.withDayOfMonth(1).truncatedTo(ChronoUnit.DAYS);
-                result = ceiling && !zdt.equals(startOfMonth) ? startOfMonth.plusMonths(1) : startOfMonth;
-                break;
-            }
-            case -3: {
-                // truncate to start of year
-                ZonedDateTime startOfYear = zdt.withDayOfYear(1).truncatedTo(ChronoUnit.DAYS);
-                result = ceiling && !zdt.equals(startOfYear) ? startOfYear.plusYears(1) : startOfYear;
-                break;
-            }
-            default:
-                logger.warn(
-                        "Scale '{}' is not supported for DateTimeType. Supported negative values are -1 (week), -2 (month), -3 (year). Returning original state.",
-                        scaleValue);
-                return state;
-        }
-        return new DateTimeType(result);
     }
 
     private BigDecimal roundNumber(BigDecimal value) {

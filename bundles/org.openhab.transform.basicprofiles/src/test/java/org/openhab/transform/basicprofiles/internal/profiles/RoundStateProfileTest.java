@@ -19,16 +19,21 @@ import static org.mockito.Mockito.*;
 
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.Locale;
 
 import javax.measure.Unit;
 import javax.measure.quantity.Temperature;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.openhab.core.config.core.Configuration;
+import org.openhab.core.library.types.DateTimeType;
 import org.openhab.core.library.types.DecimalType;
 import org.openhab.core.library.types.QuantityType;
 import org.openhab.core.library.unit.ImperialUnits;
@@ -49,11 +54,22 @@ import org.openhab.core.types.TimeSeries.Policy;
 @NonNullByDefault
 public class RoundStateProfileTest {
 
+    private @Nullable Locale savedLocale;
+
     @BeforeEach
     public void setup() {
+        savedLocale = Locale.getDefault();
         // initialize parser with ImperialUnits, otherwise units like °F are unknown
         @SuppressWarnings("unused")
         Unit<Temperature> fahrenheit = ImperialUnits.FAHRENHEIT;
+    }
+
+    @AfterEach
+    public void tearDown() {
+        Locale saved = savedLocale;
+        if (saved != null) {
+            Locale.setDefault(saved);
+        }
     }
 
     @Test
@@ -218,6 +234,156 @@ public class RoundStateProfileTest {
         assertEquals(now, entry.timestamp());
         DecimalType dtResult = (DecimalType) entry.state();
         assertThat(dtResult.doubleValue(), is(23.3));
+    }
+
+    @Test
+    public void testDateTimeTypeWeekFloor_MondayLocale() {
+        // Wednesday 2024-01-17 in a Monday-start locale → Monday 2024-01-15
+        Locale.setDefault(Locale.GERMANY);
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 1);
+
+        ZonedDateTime wednesday = ZonedDateTime.of(2024, 1, 17, 10, 30, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(wednesday);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2024, 1, 15, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
+    }
+
+    @Test
+    public void testDateTimeTypeWeekFloor_SundayLocale() {
+        // Wednesday 2024-01-17 in a Sunday-start locale → Sunday 2024-01-14
+        Locale.setDefault(Locale.US);
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 1);
+
+        ZonedDateTime wednesday = ZonedDateTime.of(2024, 1, 17, 10, 30, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(wednesday);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2024, 1, 14, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
+    }
+
+    @Test
+    public void testDateTimeTypeWeekCeiling_MondayLocale() {
+        // Wednesday 2024-01-17 with CEILING in a Monday-start locale → Monday 2024-01-22
+        Locale.setDefault(Locale.GERMANY);
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 1, RoundingMode.CEILING.name());
+
+        ZonedDateTime wednesday = ZonedDateTime.of(2024, 1, 17, 10, 30, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(wednesday);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2024, 1, 22, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
+    }
+
+    @Test
+    public void testDateTimeTypeMonthFloor() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 2);
+
+        ZonedDateTime midMonth = ZonedDateTime.of(2024, 3, 15, 14, 30, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(midMonth);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2024, 3, 1, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
+    }
+
+    @Test
+    public void testDateTimeTypeMonthCeiling() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 2, RoundingMode.CEILING.name());
+
+        ZonedDateTime midMonth = ZonedDateTime.of(2024, 3, 15, 14, 30, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(midMonth);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2024, 4, 1, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
+    }
+
+    @Test
+    public void testDateTimeTypeMonthCeiling_AlreadyAtBoundary() {
+        // If already at the first of the month, CEILING should not advance to next month
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 2, RoundingMode.CEILING.name());
+
+        ZonedDateTime firstOfMonth = ZonedDateTime.of(2024, 3, 1, 0, 0, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(firstOfMonth);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        assertThat(resultZdt, is(firstOfMonth));
+    }
+
+    @Test
+    public void testDateTimeTypeYearFloor() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 3);
+
+        ZonedDateTime midYear = ZonedDateTime.of(2024, 7, 4, 12, 0, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(midYear);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2024, 1, 1, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
+    }
+
+    @Test
+    public void testDateTimeTypeYearCeiling() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile roundProfile = createProfile(callback, null, 3, RoundingMode.CEILING.name());
+
+        ZonedDateTime midYear = ZonedDateTime.of(2024, 7, 4, 12, 0, 0, 0, ZoneId.systemDefault());
+        State state = new DateTimeType(midYear);
+        roundProfile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime resultZdt = result.getZonedDateTime(ZoneId.systemDefault());
+        ZonedDateTime expected = ZonedDateTime.of(2025, 1, 1, 0, 0, 0, 0, ZoneId.systemDefault());
+        assertThat(resultZdt, is(expected));
     }
 
     private RoundStateProfile createProfile(ProfileCallback callback, @Nullable Integer precision,

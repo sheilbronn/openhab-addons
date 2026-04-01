@@ -17,9 +17,13 @@ import static org.openhab.transform.basicprofiles.internal.factory.BasicProfiles
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
+import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
+import org.openhab.core.library.types.DateTimeType;
 import org.openhab.core.library.types.DecimalType;
 import org.openhab.core.library.types.QuantityType;
 import org.openhab.core.thing.profiles.ProfileCallback;
@@ -36,10 +40,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Applies rounding with the specified scale and the rounding mode to a {@link QuantityType} or {@link DecimalType}
- * state. Default rounding mode is {@link RoundingMode#HALF_UP}.
+ * Applies rounding with the specified scale and the rounding mode to a {@link QuantityType}, {@link DecimalType}, or
+ * {@link DateTimeType} state. Default rounding mode is {@link RoundingMode#HALF_UP}.
+ *
+ * <p>
+ * For {@link DateTimeType} values the {@code scale} parameter selects the time unit to round to,
+ * following the {@link ChronoUnit} ordinal convention:
+ * 0=DAYS, 1=HOURS, 2=MINUTES, 3=SECONDS, 4=MILLIS.
+ * Truncation to DAYS uses the timezone embedded in the DateTime value.
  *
  * @author Christoph Weitkamp - Initial contribution
+ * @author sheilbronn - DateTime support (issue openhab/openhab-addons#20497)
  */
 @NonNullByDefault
 public class RoundStateProfile implements TimeSeriesProfile {
@@ -139,6 +150,8 @@ public class RoundStateProfile implements TimeSeriesProfile {
         } else if (state instanceof DecimalType dtState) {
             BigDecimal rounded = roundNumber(dtState.toBigDecimal());
             return new DecimalType(rounded);
+        } else if (state instanceof DateTimeType dtState) {
+            return applyRoundToDateTime(dtState);
         } else {
             logger.warn(
                     "Round cannot be applied to the incompatible state '{}' sent from the binding. Returning original state.",
@@ -157,5 +170,67 @@ public class RoundStateProfile implements TimeSeriesProfile {
             result = result.setScale(scale.intValue(), roundingMode);
         }
         return result;
+    }
+
+    private Type applyRoundToDateTime(DateTimeType dtState) {
+        Integer localScale = scale;
+        if (localScale == null) {
+            logger.warn("Round profile requires 'scale' to round DateTime values. Returning original state.");
+            return dtState;
+        }
+
+        ChronoUnit unit = scaleToChronoUnit(localScale);
+        if (unit == null) {
+            logger.warn(
+                    "Round profile 'scale={}' is not supported for DateTime values (valid range: 0=DAYS to 4=MILLIS). Returning original state.",
+                    localScale);
+            return dtState;
+        }
+
+        ZonedDateTime zdt = dtState.getZonedDateTime();
+        ZonedDateTime truncated = zdt.truncatedTo(unit);
+
+        ZonedDateTime rounded;
+        switch (roundingMode) {
+            case UP:
+            case CEILING:
+                rounded = zdt.equals(truncated) ? truncated : truncated.plus(1, unit);
+                break;
+            case HALF_UP:
+            case HALF_EVEN:
+                rounded = Duration.between(truncated, zdt).multipliedBy(2)
+                        .compareTo(unit.getDuration()) >= 0 ? truncated.plus(1, unit) : truncated;
+                break;
+            case HALF_DOWN:
+                rounded = Duration.between(truncated, zdt).multipliedBy(2)
+                        .compareTo(unit.getDuration()) > 0 ? truncated.plus(1, unit) : truncated;
+                break;
+            case DOWN:
+            case FLOOR:
+            default:
+                rounded = truncated;
+                break;
+        }
+
+        return new DateTimeType(rounded);
+    }
+
+    /**
+     * Maps a {@code scale} integer to a {@link ChronoUnit} for DateTime rounding.
+     * The mapping follows the ChronoUnit ordinal convention proposed in issue #20497:
+     * 0=DAYS, 1=HOURS, 2=MINUTES, 3=SECONDS, 4=MILLIS.
+     *
+     * @param scale the scale value from the profile configuration
+     * @return the corresponding {@link ChronoUnit}, or {@code null} if out of range
+     */
+    private static @Nullable ChronoUnit scaleToChronoUnit(int scale) {
+        return switch (scale) {
+            case 0 -> ChronoUnit.DAYS;
+            case 1 -> ChronoUnit.HOURS;
+            case 2 -> ChronoUnit.MINUTES;
+            case 3 -> ChronoUnit.SECONDS;
+            case 4 -> ChronoUnit.MILLIS;
+            default -> null;
+        };
     }
 }

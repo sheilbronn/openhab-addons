@@ -19,6 +19,8 @@ import static org.mockito.Mockito.*;
 
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 
 import javax.measure.Unit;
 import javax.measure.quantity.Temperature;
@@ -29,6 +31,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.openhab.core.config.core.Configuration;
+import org.openhab.core.library.types.DateTimeType;
 import org.openhab.core.library.types.DecimalType;
 import org.openhab.core.library.types.QuantityType;
 import org.openhab.core.library.unit.ImperialUnits;
@@ -45,6 +48,7 @@ import org.openhab.core.types.TimeSeries.Policy;
  * Basic unit tests for {@link RoundStateProfile}.
  *
  * @author Christoph Weitkamp - Initial contribution
+ * @author sheilbronn - DateTime test cases (issue openhab/openhab-addons#20497)
  */
 @NonNullByDefault
 public class RoundStateProfileTest {
@@ -218,6 +222,128 @@ public class RoundStateProfileTest {
         assertEquals(now, entry.timestamp());
         DecimalType dtResult = (DecimalType) entry.state();
         assertThat(dtResult.doubleValue(), is(23.3));
+    }
+
+    // --- DateTime tests (issue #20497) ---
+
+    @Test
+    public void testDateTimeFloorToMinutes() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile profile = createProfile(callback, null, 2, RoundingMode.FLOOR.name());
+
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 28, 500_000_000, ZoneId.of("Europe/Berlin"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime expected = ZonedDateTime.of(2025, 9, 27, 14, 16, 0, 0, ZoneId.of("Europe/Berlin"));
+        assertThat(result.getZonedDateTime().toInstant(), is(expected.toInstant()));
+    }
+
+    @Test
+    public void testDateTimeCeilingToHours() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile profile = createProfile(callback, null, 1, RoundingMode.CEILING.name());
+
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 28, 0, ZoneId.of("Europe/Berlin"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime expected = ZonedDateTime.of(2025, 9, 27, 15, 0, 0, 0, ZoneId.of("Europe/Berlin"));
+        assertThat(result.getZonedDateTime().toInstant(), is(expected.toInstant()));
+    }
+
+    @Test
+    public void testDateTimeCeilingToHoursWhenAlreadyOnBoundary() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile profile = createProfile(callback, null, 1, RoundingMode.CEILING.name());
+
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 0, 0, 0, ZoneId.of("Europe/Berlin"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        // exactly on boundary: no rounding up
+        assertThat(result.getZonedDateTime().toInstant(), is(input.toInstant()));
+    }
+
+    @Test
+    public void testDateTimeHalfUpToMinutesRoundsUp() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile profile = createProfile(callback, null, 2, RoundingMode.HALF_UP.name());
+
+        // 14:16:30 exactly = half a minute → rounds UP
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 30, 0, ZoneId.of("UTC"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime expected = ZonedDateTime.of(2025, 9, 27, 14, 17, 0, 0, ZoneId.of("UTC"));
+        assertThat(result.getZonedDateTime().toInstant(), is(expected.toInstant()));
+    }
+
+    @Test
+    public void testDateTimeHalfUpToMinutesRoundsDown() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile profile = createProfile(callback, null, 2, RoundingMode.HALF_UP.name());
+
+        // 14:16:29.999 < half a minute → rounds DOWN
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 29, 999_000_000, ZoneId.of("UTC"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime expected = ZonedDateTime.of(2025, 9, 27, 14, 16, 0, 0, ZoneId.of("UTC"));
+        assertThat(result.getZonedDateTime().toInstant(), is(expected.toInstant()));
+    }
+
+    @Test
+    public void testDateTimeFloorToDays() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        RoundStateProfile profile = createProfile(callback, null, 0, RoundingMode.FLOOR.name());
+
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 28, 0, ZoneId.of("Europe/Berlin"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        ZonedDateTime expected = ZonedDateTime.of(2025, 9, 27, 0, 0, 0, 0, ZoneId.of("Europe/Berlin"));
+        assertThat(result.getZonedDateTime().toInstant(), is(expected.toInstant()));
+    }
+
+    @Test
+    public void testDateTimeInvalidScaleReturnsOriginal() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        // scale=5 is out of range for DateTime (valid: 0–4)
+        RoundStateProfile profile = createProfile(callback, null, 5);
+
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 28, 0, ZoneId.of("UTC"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        assertThat(capture.getValue(), is(state));
     }
 
     private RoundStateProfile createProfile(ProfileCallback callback, @Nullable Integer precision,

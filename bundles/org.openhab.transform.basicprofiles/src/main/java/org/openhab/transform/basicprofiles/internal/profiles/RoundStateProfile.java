@@ -47,6 +47,7 @@ import org.slf4j.LoggerFactory;
  * For {@link DateTimeType} values the {@code scale} parameter selects the time unit to round to,
  * following the {@link ChronoUnit} ordinal convention:
  * 0=DAYS, 1=HOURS, 2=MINUTES, 3=SECONDS, 4=MILLIS.
+ * When {@code scale} is omitted for a DateTime item the default is {@code 2} (MINUTES).
  * Truncation to DAYS uses the timezone embedded in the DateTime value.
  *
  * @author Christoph Weitkamp - Initial contribution
@@ -172,11 +173,14 @@ public class RoundStateProfile implements TimeSeriesProfile {
         return result;
     }
 
+    private static final int DATETIME_DEFAULT_SCALE = 2; // MINUTES
+
     private Type applyRoundToDateTime(DateTimeType dtState) {
         Integer localScale = scale;
         if (localScale == null) {
-            logger.warn("Round profile requires 'scale' to round DateTime values. Returning original state.");
-            return dtState;
+            logger.debug("Round profile: 'scale' not set for DateTime value, defaulting to {} (MINUTES).",
+                    DATETIME_DEFAULT_SCALE);
+            localScale = DATETIME_DEFAULT_SCALE;
         }
 
         ChronoUnit unit = scaleToChronoUnit(localScale);

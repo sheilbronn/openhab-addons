@@ -331,6 +331,25 @@ public class RoundStateProfileTest {
     }
 
     @Test
+    public void testDateTimeNoScaleDefaultsToMinutes() {
+        ProfileCallback callback = mock(ProfileCallback.class);
+        // no scale provided — should default to 2 (MINUTES)
+        RoundStateProfile profile = createProfile(callback, null, null);
+
+        ZonedDateTime input = ZonedDateTime.of(2025, 9, 27, 14, 16, 28, 500_000_000, ZoneId.of("UTC"));
+        State state = new DateTimeType(input);
+        profile.onStateUpdateFromHandler(state);
+
+        ArgumentCaptor<State> capture = ArgumentCaptor.forClass(State.class);
+        verify(callback, times(1)).sendUpdate(capture.capture());
+
+        DateTimeType result = (DateTimeType) capture.getValue();
+        // HALF_UP default: 28.5s > 30s threshold? No — rounds DOWN to 14:16:00
+        ZonedDateTime expected = ZonedDateTime.of(2025, 9, 27, 14, 16, 0, 0, ZoneId.of("UTC"));
+        assertThat(result.getZonedDateTime().toInstant(), is(expected.toInstant()));
+    }
+
+    @Test
     public void testDateTimeInvalidScaleReturnsOriginal() {
         ProfileCallback callback = mock(ProfileCallback.class);
         // scale=5 is out of range for DateTime (valid: 0–4)

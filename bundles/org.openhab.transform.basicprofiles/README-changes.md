@@ -12,13 +12,14 @@ Add the following after the existing numeric examples and before the end of the 
 
 For `DateTime` items, the `scale` parameter is interpreted as a time unit index and rounding snaps
 the value to the nearest boundary of that unit using the specified `mode`.
+When `scale` is omitted for a DateTime item, it defaults to `2` (MINUTES).
 Truncating to days uses the timezone embedded in the DateTime value (or the system timezone if none is present).
 
 | `scale` | Rounding unit for DateTime |
 |:---:|:---|
 | 0 | DAYS — truncates/rounds to midnight of the item's timezone |
 | 1 | HOURS |
-| 2 | MINUTES |
+| 2 | MINUTES *(default when scale is omitted)* |
 | 3 | SECONDS |
 | 4 | MILLISECONDS |
 

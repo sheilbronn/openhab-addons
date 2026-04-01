@@ -202,12 +202,14 @@ public class RoundStateProfile implements TimeSeriesProfile {
                 break;
             case HALF_UP:
             case HALF_EVEN:
-                rounded = Duration.between(truncated, zdt).multipliedBy(2)
-                        .compareTo(unit.getDuration()) >= 0 ? truncated.plus(1, unit) : truncated;
+                rounded = Duration.between(truncated, zdt).multipliedBy(2).compareTo(unit.getDuration()) >= 0
+                        ? truncated.plus(1, unit)
+                        : truncated;
                 break;
             case HALF_DOWN:
-                rounded = Duration.between(truncated, zdt).multipliedBy(2)
-                        .compareTo(unit.getDuration()) > 0 ? truncated.plus(1, unit) : truncated;
+                rounded = Duration.between(truncated, zdt).multipliedBy(2).compareTo(unit.getDuration()) > 0
+                        ? truncated.plus(1, unit)
+                        : truncated;
                 break;
             case DOWN:
             case FLOOR:

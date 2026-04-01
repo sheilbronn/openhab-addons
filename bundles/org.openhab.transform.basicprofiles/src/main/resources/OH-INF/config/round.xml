@@ -11,7 +11,8 @@
 		</parameter>
 		<parameter name="scale" type="integer" min="-16" max="16" step="1" required="true">
 			<label>Scale</label>
-			<description>Scale: for numeric values it sets the number of decimal places; for DateTime values it selects the rounding unit: 0=DAYS, 1=HOURS, 2=MINUTES (default when omitted), 3=SECONDS, 4=MILLIS.</description>
+			<description>Scale: for numeric values it sets the number of decimal places; for DateTime values it selects the
+				rounding unit: 0=DAYS, 1=HOURS, 2=MINUTES (default when omitted), 3=SECONDS, 4=MILLIS.</description>
 		</parameter>
 		<parameter name="mode" type="text">
 			<label>Rounding Mode</label>

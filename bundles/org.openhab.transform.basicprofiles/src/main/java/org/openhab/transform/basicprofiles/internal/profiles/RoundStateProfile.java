@@ -164,14 +164,7 @@ public class RoundStateProfile implements TimeSeriesProfile {
     }
 
     private DateTimeType roundDateTime(DateTimeType value) {
-        final int configuredScale;
-        if (scale != null) {
-            configuredScale = scale.intValue();
-        } else {
-            configuredScale = DATETIME_DEFAULT_SCALE;
-            logger.debug("No scale configured for DateTime value. Defaulting to scale {} (seconds).",
-                    DATETIME_DEFAULT_SCALE);
-        }
+        final int configuredScale = scale != null ? scale.intValue() : DATETIME_DEFAULT_SCALE;
 
         if (precision != null) {
             logger.debug("Ignoring precision '{}' for DateTime value rounding.", precision);

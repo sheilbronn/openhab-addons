@@ -7,12 +7,14 @@
 	<config-description uri="profile:basic-profiles:round">
 		<parameter name="precision" type="integer" min="1" step="1" required="false">
 			<label>Precision</label>
-			<description>Optional. Number of significant digits to round to before applying scale.</description>
+			<description>Optional. Number of significant digits to round to before applying scale for numeric values. Ignored for
+				DateTime values.</description>
 		</parameter>
 		<parameter name="scale" type="integer" min="-16" max="16" step="1" required="true">
 			<label>Scale</label>
-			<description>Scale: for numeric values it sets the number of decimal places; for DateTime values it selects the
-				rounding unit: 0=DAYS, 1=HOURS, 2=MINUTES (default when omitted), 3=SECONDS, 4=MILLIS.</description>
+			<description>For numeric values, scale indicates the resulting number of decimal places. For DateTime values, the UTC
+				timestamp is rounded with scale 0 for days, 1 for hours, 2 for minutes, 3 for seconds, and 4 for milliseconds. If
+				omitted for DateTime values, scale 3 is used.</description>
 		</parameter>
 		<parameter name="mode" type="text">
 			<label>Rounding Mode</label>

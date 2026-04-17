@@ -112,6 +112,7 @@
 /bundles/org.openhab.binding.emotiva/ @espenaf
 /bundles/org.openhab.binding.energenie/ @hmerk
 /bundles/org.openhab.binding.energidataservice/ @jlaur
+/bundles/org.openhab.binding.energyforecast/ @weymann
 /bundles/org.openhab.binding.enigma2/ @gdolfen
 /bundles/org.openhab.binding.enocean/ @fruggy83
 /bundles/org.openhab.binding.enphase/ @Hilbrand
@@ -210,6 +211,7 @@
 /bundles/org.openhab.binding.lgtvserial/ @fa2k
 /bundles/org.openhab.binding.lgwebos/ @sprehn
 /bundles/org.openhab.binding.lifx/ @wborn
+/bundles/org.openhab.binding.linkplay/ @digitaldan
 /bundles/org.openhab.binding.linktap/ @dag81
 /bundles/org.openhab.binding.linky/ @clinique @lolodomo
 /bundles/org.openhab.binding.linuxinput/ @t-8ch
@@ -416,7 +418,9 @@
 /bundles/org.openhab.binding.tr064/ @J-N-K
 /bundles/org.openhab.binding.tradfri/ @cweitkamp @kaikreuzer
 /bundles/org.openhab.binding.tuya/ @J-N-K
+/bundles/org.openhab.binding.twilio/ @digitaldan
 /bundles/org.openhab.binding.unifi/ @mgbowman @Hilbrand
+/bundles/org.openhab.binding.unifiaccess/ @digitaldan
 /bundles/org.openhab.binding.unifiedremote/ @GiviMAD
 /bundles/org.openhab.binding.unifiprotect/ @digitaldan
 /bundles/org.openhab.binding.upb/ @marcusb

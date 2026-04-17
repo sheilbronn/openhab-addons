@@ -17,9 +17,7 @@ import static org.openhab.transform.basicprofiles.internal.factory.BasicProfiles
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
-import java.time.Duration;
-import java.time.ZonedDateTime;
-import java.time.temporal.ChronoUnit;
+import java.time.Instant;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
@@ -40,15 +38,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Applies rounding with the specified scale and the rounding mode to a {@link QuantityType}, {@link DecimalType}, or
- * {@link DateTimeType} state. Default rounding mode is {@link RoundingMode#HALF_UP}.
- *
- * <p>
- * For {@link DateTimeType} values the {@code scale} parameter selects the time unit to round to,
- * following the {@link ChronoUnit} ordinal convention:
- * 0=DAYS, 1=HOURS, 2=MINUTES, 3=SECONDS, 4=MILLIS.
- * When {@code scale} is omitted for a DateTime item the default is {@code 2} (MINUTES).
- * Truncation to DAYS uses the timezone embedded in the DateTime value.
+ * Applies rounding with the specified scale and the rounding mode to a {@link QuantityType}, {@link DecimalType},
+ * or {@link DateTimeType} state. Default rounding mode is {@link RoundingMode#HALF_UP}.
  *
  * @author Christoph Weitkamp - Initial contribution
  * @author sheilbronn - DateTime support (issue openhab/openhab-addons#20497)
@@ -61,6 +52,8 @@ public class RoundStateProfile implements TimeSeriesProfile {
     public static final String PARAM_PRECISION = "precision";
     public static final String PARAM_SCALE = "scale";
     public static final String PARAM_MODE = "mode";
+
+    private static final int DATETIME_DEFAULT_SCALE = 3;
 
     private final ProfileCallback callback;
 
@@ -78,8 +71,6 @@ public class RoundStateProfile implements TimeSeriesProfile {
         Integer localScale = null;
         if (config.scale != null) {
             localScale = config.scale;
-        } else {
-            logger.error("Parameter 'scale' is not of type String or Number.");
         }
 
         Integer localPrecision = null;
@@ -148,6 +139,8 @@ public class RoundStateProfile implements TimeSeriesProfile {
         if (state instanceof QuantityType<?> qtState) {
             BigDecimal rounded = roundNumber(qtState.toBigDecimal());
             return new QuantityType<>(rounded, qtState.getUnit());
+        } else if (state instanceof DateTimeType dtState) {
+            return roundDateTime(dtState);
         } else if (state instanceof DecimalType dtState) {
             BigDecimal rounded = roundNumber(dtState.toBigDecimal());
             return new DecimalType(rounded);
@@ -173,70 +166,83 @@ public class RoundStateProfile implements TimeSeriesProfile {
         return result;
     }
 
-    private static final int DATETIME_DEFAULT_SCALE = 2; // MINUTES
+    private DateTimeType roundDateTime(DateTimeType value) {
+        final int configuredScale = scale != null ? scale.intValue() : DATETIME_DEFAULT_SCALE;
 
-    private Type applyRoundToDateTime(DateTimeType dtState) {
-        Integer localScale = scale;
-        if (localScale == null) {
-            logger.debug("Round profile: 'scale' not set for DateTime value, defaulting to {} (MINUTES).",
-                    DATETIME_DEFAULT_SCALE);
-            localScale = DATETIME_DEFAULT_SCALE;
+        if (precision != null) {
+            logger.debug("Ignoring precision '{}' for DateTime value rounding.", precision);
         }
 
-        ChronoUnit unit = scaleToChronoUnit(localScale);
-        if (unit == null) {
+        final Long unitNanos = getDateTimeUnitNanos(configuredScale);
+        if (unitNanos == null) {
             logger.warn(
-                    "Round profile 'scale={}' is not supported for DateTime values (valid range: 0=DAYS to 4=MILLIS). Returning original state.",
-                    localScale);
-            return dtState;
+                    "Scale '{}' is not supported for DateTime values. Supported scales are 0 (days), 1 (hours), 2 (minutes), 3 (seconds), and 4 (milliseconds). Returning original state.",
+                    configuredScale);
+            return value;
         }
 
-        ZonedDateTime zdt = dtState.getZonedDateTime();
-        ZonedDateTime truncated = zdt.truncatedTo(unit);
-
-        ZonedDateTime rounded;
-        switch (roundingMode) {
-            case UP:
-            case CEILING:
-                rounded = zdt.equals(truncated) ? truncated : truncated.plus(1, unit);
-                break;
-            case HALF_UP:
-            case HALF_EVEN:
-                rounded = Duration.between(truncated, zdt).multipliedBy(2).compareTo(unit.getDuration()) >= 0
-                        ? truncated.plus(1, unit)
-                        : truncated;
-                break;
-            case HALF_DOWN:
-                rounded = Duration.between(truncated, zdt).multipliedBy(2).compareTo(unit.getDuration()) > 0
-                        ? truncated.plus(1, unit)
-                        : truncated;
-                break;
-            case DOWN:
-            case FLOOR:
-            default:
-                rounded = truncated;
-                break;
-        }
-
-        return new DateTimeType(rounded);
+        return new DateTimeType(roundInstant(value.getInstant(), unitNanos.longValue()));
     }
 
-    /**
-     * Maps a {@code scale} integer to a {@link ChronoUnit} for DateTime rounding.
-     * The mapping follows the ChronoUnit ordinal convention proposed in issue #20497:
-     * 0=DAYS, 1=HOURS, 2=MINUTES, 3=SECONDS, 4=MILLIS.
-     *
-     * @param scale the scale value from the profile configuration
-     * @return the corresponding {@link ChronoUnit}, or {@code null} if out of range
-     */
-    private static @Nullable ChronoUnit scaleToChronoUnit(int scale) {
-        return switch (scale) {
-            case 0 -> ChronoUnit.DAYS;
-            case 1 -> ChronoUnit.HOURS;
-            case 2 -> ChronoUnit.MINUTES;
-            case 3 -> ChronoUnit.SECONDS;
-            case 4 -> ChronoUnit.MILLIS;
+    private Instant roundInstant(Instant value, long unitNanos) {
+        long epochNanos = Math.addExact(Math.multiplyExact(value.getEpochSecond(), 1_000_000_000L), value.getNano());
+        long floor = Math.multiplyExact(Math.floorDiv(epochNanos, unitNanos), unitNanos);
+        if (floor == epochNanos) {
+            return instantFromEpochNanos(floor);
+        }
+        long ceiling = Math.addExact(floor, unitNanos);
+        return instantFromEpochNanos(selectRoundedEpochNanos(epochNanos, floor, ceiling, unitNanos));
+    }
+
+    private long selectRoundedEpochNanos(long value, long floor, long ceiling, long unitNanos) {
+        return switch (roundingMode) {
+            case UP -> value >= 0 ? ceiling : floor;
+            case DOWN -> value >= 0 ? floor : ceiling;
+            case CEILING -> ceiling;
+            case FLOOR -> floor;
+            case HALF_UP -> selectHalfRoundedEpochNanos(value, floor, ceiling, true);
+            case HALF_DOWN -> selectHalfRoundedEpochNanos(value, floor, ceiling, false);
+            case HALF_EVEN -> selectHalfEvenRoundedEpochNanos(value, floor, ceiling, unitNanos);
+            case UNNECESSARY -> throw new ArithmeticException("Rounding necessary");
+        };
+    }
+
+    private long selectHalfRoundedEpochNanos(long value, long floor, long ceiling, boolean tiesAwayFromZero) {
+        int distanceComparison = Long.compare(Math.subtractExact(value, floor), Math.subtractExact(ceiling, value));
+        if (distanceComparison < 0) {
+            return floor;
+        } else if (distanceComparison > 0) {
+            return ceiling;
+        }
+        if (tiesAwayFromZero) {
+            return value >= 0 ? ceiling : floor;
+        }
+        return value >= 0 ? floor : ceiling;
+    }
+
+    private long selectHalfEvenRoundedEpochNanos(long value, long floor, long ceiling, long unitNanos) {
+        int distanceComparison = Long.compare(Math.subtractExact(value, floor), Math.subtractExact(ceiling, value));
+        if (distanceComparison < 0) {
+            return floor;
+        } else if (distanceComparison > 0) {
+            return ceiling;
+        }
+        return Math.floorMod(Math.floorDiv(floor, unitNanos), 2) == 0 ? floor : ceiling;
+    }
+
+    private @Nullable Long getDateTimeUnitNanos(int configuredScale) {
+        return switch (configuredScale) {
+            case 0 -> 86_400_000_000_000L;
+            case 1 -> 3_600_000_000_000L;
+            case 2 -> 60_000_000_000L;
+            case 3 -> 1_000_000_000L;
+            case 4 -> 1_000_000L;
             default -> null;
         };
+    }
+
+    private Instant instantFromEpochNanos(long epochNanos) {
+        return Instant.ofEpochSecond(Math.floorDiv(epochNanos, 1_000_000_000L),
+                Math.floorMod(epochNanos, 1_000_000_000L));
     }
 }

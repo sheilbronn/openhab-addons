@@ -141,11 +141,11 @@ Source Channels should accept Item Type `Number` or `DateTime`.
 
 ### Round Profile Configuration
 
-| Configuration Parameter | Type    | Description                                                                                               |
-|-------------------------|---------|-----------------------------------------------------------------------------------------------------------|
+| Configuration Parameter | Type    | Description                                                                                                                                                                                                                      |
+|-------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `precision`             | integer | Limits the number of significant digits in the output for numeric values (ignored for `DateTime` values.) |
 | `scale`                 | integer | For numeric values, indicates the resulting number of decimal places (min: -16, max: 16, STEP: 1). For `DateTime` values, `0` rounds to days, `1` to hours, `2` to minutes, `3` to seconds (default), and `4` to milliseconds. |
-| `mode`                  | text    | Rounding mode to be used (e.g. `UP`, `DOWN`, `CEILING`, `FLOOR`, `HALF_UP`, or `HALF_DOWN`; default: `HALF_UP`). |
+| `mode`                  | text    | Rounding mode to be used (e.g. `UP`, `DOWN`, `CEILING`, `FLOOR`, `HALF_UP`, or `HALF_DOWN`; default: `HALF_UP`).                                                                                                                 |
 
 For numeric values, either `precision` or `scale` must be given. When both are given, `precision` is applied first, then `scale`.
 

@@ -123,7 +123,7 @@ Switch invertedSwitch { channel="xxx" [profile="basic-profiles:invert"] }
 
 The Round Profile rounds numeric values and `DateTime` values.
 
-For numeric values, it scales the State to a specific number of decimal places based on the power of ten.
+For `numeric` values, it scales the State to a specific number of decimal places based on the power of ten.
 It can also limit the precision of the State to a specific number of [significant digits](https://en.wikipedia.org/wiki/Significant_figures).
 When scaling, a specific [Rounding mode](https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/math/RoundingMode.html) may be applied.
 

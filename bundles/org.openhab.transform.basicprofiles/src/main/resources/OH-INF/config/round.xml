@@ -10,7 +10,7 @@
 			<description>Optional. Number of significant digits to round to before applying scale for numeric values. Ignored for
 				DateTime values.</description>
 		</parameter>
-		<parameter name="scale" type="integer" min="-16" max="16" step="1" required="true">
+		<parameter name="scale" type="integer" min="-16" max="16" step="1" required="false">
 			<label>Scale</label>
 			<description>For numeric values, scale indicates the resulting number of decimal places. For DateTime values, the UTC
 				timestamp is rounded with scale 0 for days, 1 for hours, 2 for minutes, 3 for seconds, and 4 for milliseconds. If

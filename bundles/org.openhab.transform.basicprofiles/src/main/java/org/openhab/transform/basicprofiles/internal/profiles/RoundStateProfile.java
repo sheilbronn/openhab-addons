@@ -42,7 +42,6 @@ import org.slf4j.LoggerFactory;
  * or {@link DateTimeType} state. Default rounding mode is {@link RoundingMode#HALF_UP}.
  *
  * @author Christoph Weitkamp - Initial contribution
- * @author sheilbronn - DateTime support (issue openhab/openhab-addons#20497)
  */
 @NonNullByDefault
 public class RoundStateProfile implements TimeSeriesProfile {
@@ -144,8 +143,6 @@ public class RoundStateProfile implements TimeSeriesProfile {
         } else if (state instanceof DecimalType dtState) {
             BigDecimal rounded = roundNumber(dtState.toBigDecimal());
             return new DecimalType(rounded);
-        } else if (state instanceof DateTimeType dtState) {
-            return applyRoundToDateTime(dtState);
         } else {
             logger.warn(
                     "Round cannot be applied to the incompatible state '{}' sent from the binding. Returning original state.",

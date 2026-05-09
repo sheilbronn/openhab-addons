@@ -19,10 +19,22 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.TooManyListenersException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -37,6 +49,8 @@ import org.openhab.binding.dahuadoor.internal.dahuaeventhandler.DHIPEventListene
 import org.openhab.binding.dahuadoor.internal.dahuaeventhandler.DahuaEventClient;
 import org.openhab.binding.dahuadoor.internal.media.Go2RtcManager;
 import org.openhab.binding.dahuadoor.internal.media.PlayStreamServlet;
+import org.openhab.binding.dahuadoor.internal.media.SipBackchannelRtpRelay;
+import org.openhab.binding.dahuadoor.internal.media.SipBackchannelSession;
 import org.openhab.binding.dahuadoor.internal.sip.SipClient;
 import org.openhab.binding.dahuadoor.internal.sip.SipEventListener;
 import org.openhab.core.library.types.OnOffType;
@@ -59,8 +73,7 @@ import com.google.gson.JsonObject;
 
 /**
  * The {@link DahuaDoorBaseHandler} is responsible for handling commands, which
- * are
- * sent to one of the channels.
+ * are sent to one of the channels.
  *
  * @author Sven Schad - Initial contribution
  */
@@ -73,10 +86,28 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
     protected Gson gson = new Gson();
 
     protected @Nullable DahuaEventClient client = null;
+
     private final PlayStreamServlet playStreamServlet;
     private @Nullable Go2RtcManager go2rtcManager;
+    private @Nullable SipBackchannelRtpRelay sipBackchannelRelay;
     private @Nullable SipClient sipClient;
+    private @Nullable Future<?> webRtcStartupJob;
+    private @Nullable Future<?> sipStartupJob;
     private @Nullable ScheduledFuture<?> sipReRegisterJob;
+    private volatile List<String> configuredOutgoingExtensions = List.of();
+    private final Map<String, String> sessionToClientId = new ConcurrentHashMap<>();
+    private final Map<String, SipClient> outgoingSipClients = new ConcurrentHashMap<>();
+    private final Map<String, SipBackchannelRtpRelay> outgoingRelays = new ConcurrentHashMap<>();
+    private final Map<String, ScheduledFuture<?>> outgoingReRegisterJobs = new ConcurrentHashMap<>();
+    private final Map<String, String> outgoingStreamNames = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> registrationState = new ConcurrentHashMap<>();
+    private final Map<String, SipBackchannelSession> backchannelSessionsByHttpSession = new ConcurrentHashMap<>();
+    private static final int SIP_BACKCHANNEL_LISTEN_PORT_OFFSET = 20000;
+    private static final long SIP_INVITE_DEDUP_MS = 1500;
+    private static final long SESSION_TTL_MS = TimeUnit.MINUTES.toMillis(30);
+    private static final int MAX_SESSION_MAPPINGS = 256;
+    private volatile boolean disposed;
+    private volatile long lastSipInviteTs = 0L;
 
     public DahuaDoorBaseHandler(Thing thing, PlayStreamServlet playStreamServlet) {
         super(thing);
@@ -117,6 +148,8 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
 
     @Override
     public void initialize() {
+        disposed = false;
+
         DahuaDoorConfiguration localConfig = getConfigAs(DahuaDoorConfiguration.class);
         config = localConfig;
 
@@ -139,8 +172,16 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
             return;
         }
 
+        if ((localConfig.enableWebRTC || localConfig.enableSip) && !validateBackchannelPorts(localConfig)) {
+            return;
+        }
+
         client = new DahuaEventClient(localConfig.hostname, localConfig.username, localConfig.password,
                 localConfig.useHttps, this, this::errorInformer);
+
+        if (localConfig.enableWebRTC && localConfig.enableSip) {
+            startSipBackchannelRelay(localConfig);
+        }
 
         if (localConfig.enableWebRTC) {
             startWebRtc(localConfig);
@@ -155,11 +196,114 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
         updateStatus(ThingStatus.UNKNOWN);
     }
 
+    private void startSipBackchannelRelay(DahuaDoorConfiguration cfg) {
+        if (parseSipExtensions(cfg.sipExtension).isEmpty()) {
+            return;
+        }
+        int listenPort = cfg.go2rtcApiPort + SIP_BACKCHANNEL_LISTEN_PORT_OFFSET;
+        if (!isValidPort(listenPort)) {
+            logger.warn(
+                    "SIP backchannel relay port {} is outside valid range (go2rtcApiPort={}, offset={}) - relay disabled",
+                    listenPort, cfg.go2rtcApiPort, SIP_BACKCHANNEL_LISTEN_PORT_OFFSET);
+            return;
+        }
+        SipBackchannelRtpRelay relay = new SipBackchannelRtpRelay(getThing().getUID() + "/default", listenPort, 0);
+        try {
+            relay.start();
+            int sourcePort = relay.getSourcePort();
+            if (!isValidPort(sourcePort)) {
+                relay.stop();
+                logger.warn("SIP backchannel relay source port {} is outside valid range - relay disabled", sourcePort);
+                return;
+            }
+            sipBackchannelRelay = relay;
+        } catch (IOException e) {
+            sipBackchannelRelay = null;
+            logger.warn("Failed to start SIP backchannel RTP relay on 127.0.0.1:{}: {}", listenPort, e.getMessage(), e);
+        }
+    }
+
+    private void stopSipBackchannelRelay() {
+        SipBackchannelRtpRelay relay = sipBackchannelRelay;
+        sipBackchannelRelay = null;
+        if (relay != null) {
+            relay.stop();
+        }
+    }
+
+    /**
+     * Starts the go2rtc sidecar and registers the SDP proxy servlet for this thing.
+     * Runs in a background thread to avoid blocking the openHAB initialize() call.
+     *
+     * @param cfg current configuration snapshot
+     */
+    private void startWebRtc(DahuaDoorConfiguration cfg) {
+        String thingUidSafe = getThing().getUID().toString().replace(":", "_").replace("-", "_").replace(".", "_");
+        String defaultStreamName = GO2RTC_STREAM_PREFIX + thingUidSafe;
+        List<Go2RtcManager.StreamEntry> streamEntries = new ArrayList<>();
+
+        outgoingStreamNames.clear();
+        List<String> extensions = parseSipExtensions(cfg.sipExtension);
+        if (extensions.isEmpty()) {
+            streamEntries.add(new Go2RtcManager.StreamEntry(defaultStreamName,
+                    cfg.go2rtcApiPort + SIP_BACKCHANNEL_LISTEN_PORT_OFFSET));
+        } else {
+            for (int i = 0; i < extensions.size(); i++) {
+                String extension = extensions.get(i);
+                int backchannelPort = cfg.go2rtcApiPort + SIP_BACKCHANNEL_LISTEN_PORT_OFFSET + i;
+                String streamName = GO2RTC_STREAM_PREFIX + thingUidSafe + "_sip" + i;
+                streamEntries.add(new Go2RtcManager.StreamEntry(streamName, backchannelPort));
+                outgoingStreamNames.put(extension, streamName);
+            }
+        }
+
+        String mainStreamName = streamEntries.getFirst().streamName();
+
+        Go2RtcManager manager = new Go2RtcManager(cfg.go2rtcPath, cfg.go2rtcApiPort, cfg.webRtcPort, cfg.stunServer,
+                cfg.hostname, cfg.username, cfg.password, cfg.rtspChannel, cfg.rtspSubtype, streamEntries);
+        go2rtcManager = manager;
+
+        String proxyPath = extensions.isEmpty() ? WEBRTC_SERVLET_PATH + "/" + mainStreamName
+                : WEBRTC_SERVLET_PATH + "/session?thing="
+                        + URLEncoder.encode(getThing().getUID().toString(), StandardCharsets.UTF_8);
+        updateState(CHANNEL_WEBRTC_URL, new StringType(proxyPath));
+
+        webRtcStartupJob = scheduler.submit(() -> {
+            try {
+                if (disposed || !Objects.equals(go2rtcManager, manager)) {
+                    return;
+                }
+
+                // 2. Start go2rtc (includes blocking health-check polling)
+                manager.start();
+
+                if (disposed || !Objects.equals(go2rtcManager, manager)) {
+                    manager.stop();
+                    return;
+                }
+
+                for (Go2RtcManager.StreamEntry streamEntry : streamEntries) {
+                    playStreamServlet.registerStream(streamEntry.streamName(), cfg.go2rtcApiPort, this);
+                }
+                logger.info("WebRTC streaming active for {} at {}", mainStreamName, proxyPath);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (IOException e) {
+                logger.warn("Failed to start WebRTC streaming for {}: {}", mainStreamName, e.getMessage(), e);
+                if (!disposed && Objects.equals(go2rtcManager, manager)) {
+                    updateState(CHANNEL_WEBRTC_URL, UnDefType.UNDEF);
+                    updateStatus(ThingStatus.ONLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                            "WebRTC startup failed: " + e.getMessage());
+                }
+            }
+        });
+    }
+
     @Override
     public void dispose() {
+        disposed = true;
         stopSip();
         stopWebRtc();
-
         DahuaEventClient localClient = client;
         if (localClient != null) {
             localClient.dispose();
@@ -167,96 +311,25 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
         }
     }
 
-    private void startWebRtc(DahuaDoorConfiguration cfg) {
-        String thingUidSafe = getThing().getUID().toString().replace(':', '_').replace('-', '_').replace('.', '_');
-        String streamName = GO2RTC_STREAM_PREFIX + thingUidSafe;
-
-        Go2RtcManager manager = new Go2RtcManager(cfg.go2rtcPath, cfg.go2rtcApiPort, cfg.webRtcPort, cfg.stunServer,
-                streamName, cfg.hostname, cfg.username, cfg.password, cfg.rtspChannel, cfg.rtspSubtype);
-        go2rtcManager = manager;
-
-        String proxyPath = WEBRTC_SERVLET_PATH + "/" + streamName;
-        updateState(CHANNEL_WEBRTC_URL, new StringType(proxyPath));
-
-        scheduler.submit(() -> {
-            try {
-                manager.start();
-                playStreamServlet.registerStream(streamName, cfg.go2rtcApiPort);
-                logger.info("WebRTC streaming active for {} at {}", streamName, proxyPath);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (IOException e) {
-                logger.warn("Failed to start WebRTC streaming for {}: {}", streamName, e.getMessage(), e);
-            }
-        });
-    }
-
+    /**
+     * Stops the go2rtc sidecar and de-registers the SDP proxy servlet entry for this thing.
+     */
     private void stopWebRtc() {
+        Future<?> localStartupJob = webRtcStartupJob;
+        webRtcStartupJob = null;
+        if (localStartupJob != null) {
+            localStartupJob.cancel(true);
+        }
+
         Go2RtcManager localManager = go2rtcManager;
         go2rtcManager = null;
         if (localManager != null) {
-            playStreamServlet.unregisterStream(localManager.getStreamName());
+            for (String streamName : localManager.getStreamNames()) {
+                playStreamServlet.unregisterStream(streamName);
+            }
             localManager.stop();
         }
-    }
-
-    private void startSip(DahuaDoorConfiguration cfg) {
-        if (cfg.sipExtension.isBlank()) {
-            logger.warn("SIP enabled but sipExtension not configured - skipping SIP registration");
-            updateState(CHANNEL_SIP_REGISTERED, OnOffType.OFF);
-            updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.IDLE.name()));
-            return;
-        }
-
-        scheduler.submit(() -> {
-            try {
-                String localIp = detectLocalIp(cfg.hostname);
-                String sipPass = !cfg.sipPassword.isEmpty() ? cfg.sipPassword : cfg.password;
-
-                SipClient localSipClient = new SipClient(cfg.hostname, cfg.sipExtension, cfg.sipExtension, sipPass,
-                        cfg.localSipPort, localIp, cfg.sipRealm, this, this::errorInformer);
-                sipClient = localSipClient;
-
-                localSipClient.sendRegister();
-                sipReRegisterJob = scheduler.scheduleWithFixedDelay(() -> {
-                    SipClient currentClient = sipClient;
-                    if (currentClient != null) {
-                        currentClient.sendRegister();
-                    }
-                }, 50, 50, TimeUnit.SECONDS);
-
-                logger.info("SIP client started for extension {} at {}:{}", cfg.sipExtension, localIp,
-                        cfg.localSipPort);
-            } catch (IOException | PeerUnavailableException | TransportNotSupportedException | InvalidArgumentException
-                    | ObjectInUseException | TooManyListenersException e) {
-                logger.warn("Failed to start SIP client: {}", e.getMessage(), e);
-                updateState(CHANNEL_SIP_REGISTERED, OnOffType.OFF);
-            }
-        });
-    }
-
-    private void stopSip() {
-        ScheduledFuture<?> localJob = sipReRegisterJob;
-        sipReRegisterJob = null;
-        if (localJob != null) {
-            localJob.cancel(true);
-        }
-
-        SipClient localSipClient = sipClient;
-        sipClient = null;
-        if (localSipClient != null) {
-            localSipClient.dispose();
-            logger.debug("SIP client stopped");
-        }
-        updateState(CHANNEL_SIP_REGISTERED, OnOffType.OFF);
-        updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.IDLE.name()));
-    }
-
-    private String detectLocalIp(String vtoHostname) throws IOException {
-        try (DatagramSocket socket = new DatagramSocket()) {
-            socket.connect(InetAddress.getByName(vtoHostname), 5060);
-            return socket.getLocalAddress().getHostAddress();
-        }
+        stopSipBackchannelRelay();
     }
 
     public void saveSnapshot(byte @Nullable [] buffer) {
@@ -617,8 +690,15 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
 
     protected void handleSIPRegisterResult(JsonObject eventList, JsonObject eventData) {
         if ("Pulse".equals(eventList.get("Action").getAsString())) {
-            if (eventData.get("Success").getAsBoolean()) {
+            boolean success = eventData.get("Success").getAsBoolean();
+            DahuaDoorConfiguration localConfig = config;
+            if (success) {
                 logger.debug("Event SIPRegisterResult, Success");
+                DahuaEventClient localClient = client;
+                if (localConfig != null && localConfig.enableWebRTC && localClient != null
+                        && !parseSipExtensions(localConfig.sipExtension).isEmpty()) {
+                    scheduler.submit(localClient::fixAudioCodec);
+                }
             } else {
                 logger.debug("Event SIPRegisterResult, Failed");
             }
@@ -695,45 +775,6 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
         logger.debug("Event Call from VTO");
     }
 
-    @Override
-    public void onRegistrationSuccess() {
-        logger.debug("SIP registration successful");
-        updateState(CHANNEL_SIP_REGISTERED, OnOffType.ON);
-    }
-
-    @Override
-    public void onRegistrationFailed(String reason) {
-        logger.warn("SIP registration failed: {}", reason);
-        updateState(CHANNEL_SIP_REGISTERED, OnOffType.OFF);
-    }
-
-    @Override
-    public void onInviteReceived(String callerId) {
-        logger.info("SIP INVITE received from {}", callerId);
-        updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.RINGING.name()));
-        onButtonPressed(1);
-    }
-
-    @Override
-    public void onCallCancelled() {
-        updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.IDLE.name()));
-    }
-
-    @Override
-    public void onCallActive() {
-        updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.ACTIVE.name()));
-    }
-
-    @Override
-    public void onCallTerminating() {
-        updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.TERMINATING.name()));
-    }
-
-    @Override
-    public void onCallEnded() {
-        updateState(CHANNEL_SIP_CALL_STATE, new StringType(SipClient.SipCallState.IDLE.name()));
-    }
-
     /**
      * Abstract method to handle button press events with lock number identification.
      * Subclasses must implement this to handle single or multi-button devices.
@@ -741,4 +782,649 @@ public abstract class DahuaDoorBaseHandler extends BaseThingHandler implements D
      * @param lockNumber The lock number from the Invite event (1 or 2)
      */
     protected abstract void onButtonPressed(int lockNumber);
+
+    /**
+     * Routes a resolved doorbell event from DHIP to the concrete device handler.
+     *
+     * DHIP remains lossless and authoritative for LockNum-based button mapping, so no time-based dedup
+     * or SIP gating is applied here.
+     *
+     * @param source event source label for logging (for example "DHIP")
+     * @param lockNumber resolved doorbell/button number
+     */
+    protected void handleResolvedDoorbellEvent(String source, int lockNumber) {
+        logger.debug("Resolved {} doorbell event for lock {}", source, lockNumber);
+        onButtonPressed(lockNumber);
+    }
+
+    /**
+     * Deduplicates SIP INVITE callbacks so UDP retransmits do not spam state updates and logs.
+     *
+     * @param source event source label for logging (for example "SIP")
+     * @return true when caller should continue processing, false when event should be ignored as duplicate
+     */
+    protected boolean shouldProcessSipInvite(String source) {
+        long now = System.currentTimeMillis();
+        long previous = lastSipInviteTs;
+        if (previous > 0 && (now - previous) < SIP_INVITE_DEDUP_MS) {
+            logger.debug("Ignoring duplicate {} INVITE ({} ms after previous event)", source, now - previous);
+            return false;
+        }
+        lastSipInviteTs = now;
+        return true;
+    }
+
+    // ============================================================================
+    // SIP Client Integration (Phase 1: Minimal Signaling)
+    // ============================================================================
+
+    /**
+     * Starts the SIP client and registers with the VTO SIP server.
+     * Runs in a background thread to avoid blocking the initialize() call.
+     *
+     * @param cfg current configuration snapshot
+     */
+    private void startSip(DahuaDoorConfiguration cfg) {
+        List<String> sipExtensions = parseSipExtensions(cfg.sipExtension);
+        configuredOutgoingExtensions = sipExtensions;
+
+        if (sipExtensions.isEmpty()) {
+            logger.warn("SIP enabled but sipExtension is empty - skipping SIP startup");
+            updateState(CHANNEL_SIP_REGISTERED, UnDefType.UNDEF);
+            updateState(CHANNEL_SIP_CALL_STATE, UnDefType.UNDEF);
+            return;
+        }
+
+        sipStartupJob = scheduler.submit(() -> {
+            try {
+                String localIp = detectLocalIp(cfg.hostname);
+                logger.debug("Detected local IP: {}", localIp);
+
+                if (disposed) {
+                    return;
+                }
+
+                for (int i = 0; i < sipExtensions.size(); i++) {
+                    String extension = sipExtensions.get(i);
+                    int sipPort = cfg.localSipPort + i;
+                    int backchannelPort = cfg.go2rtcApiPort + SIP_BACKCHANNEL_LISTEN_PORT_OFFSET + i;
+                    startOutgoingSipClient(cfg, extension, sipPort, backchannelPort, localIp);
+                }
+
+                if (outgoingSipClients.isEmpty()) {
+                    updateState(CHANNEL_SIP_REGISTERED, UnDefType.UNDEF);
+                }
+            } catch (IOException e) {
+                logger.warn("Failed to start SIP client: {}", e.getMessage(), e);
+                updateState(CHANNEL_SIP_REGISTERED, OnOffType.OFF);
+            } catch (RuntimeException e) {
+                logger.warn("Failed to start SIP client: {}", e.getMessage(), e);
+                updateState(CHANNEL_SIP_REGISTERED, OnOffType.OFF);
+            }
+        });
+    }
+
+    private void startOutgoingSipClient(DahuaDoorConfiguration cfg, String extension, int sipPort, int backchannelPort,
+            String localIp) {
+        SipBackchannelRtpRelay relay = null;
+        try {
+            relay = new SipBackchannelRtpRelay(getThing().getUID() + "/" + extension, backchannelPort, 0);
+            relay.start();
+
+            String sipPass = !cfg.sipPassword.isEmpty() ? cfg.sipPassword : cfg.password;
+            SipClient client = new SipClient(cfg.hostname, extension, extension, sipPass, sipPort, localIp,
+                    cfg.sipRealm, relay.getSourcePort(), relay, new PooledSipAdapter(extension), this::errorInformer);
+
+            outgoingRelays.put(extension, relay);
+            outgoingSipClients.put(extension, client);
+            if (sipClient == null) {
+                sipClient = client;
+            }
+            registrationState.put(extension, false);
+            client.sendRegister();
+
+            ScheduledFuture<?> job = scheduler.scheduleWithFixedDelay(() -> {
+                SipClient localClient = outgoingSipClients.get(extension);
+                if (localClient != null && !disposed) {
+                    localClient.sendRegister();
+                }
+            }, 45, 45, TimeUnit.SECONDS);
+            outgoingReRegisterJobs.put(extension, job);
+        } catch (IOException | PeerUnavailableException | TransportNotSupportedException | InvalidArgumentException
+                | ObjectInUseException | TooManyListenersException | RuntimeException e) {
+            logger.warn("Failed to start outgoing SIP client {} on SIP {} / RTP {} ({}): {}", extension, sipPort,
+                    backchannelPort, e.getClass().getSimpleName(), e.getMessage(), e);
+            registrationState.put(extension, false);
+            outgoingSipClients.remove(extension);
+            ScheduledFuture<?> job = outgoingReRegisterJobs.remove(extension);
+            if (job != null) {
+                job.cancel(true);
+            }
+            outgoingStreamNames.remove(extension);
+            if (relay != null) {
+                relay.stop();
+            }
+            outgoingRelays.remove(extension);
+        }
+    }
+
+    /**
+     * Stops the SIP client and cancels the re-REGISTER job.
+     */
+    private void stopSip() {
+        Future<?> localStartupJob = sipStartupJob;
+        sipStartupJob = null;
+        if (localStartupJob != null) {
+            localStartupJob.cancel(true);
+        }
+
+        ScheduledFuture<?> localJob = sipReRegisterJob;
+        sipReRegisterJob = null;
+        if (localJob != null) {
+            localJob.cancel(true);
+        }
+
+        sipClient = null;
+
+        outgoingReRegisterJobs.values().forEach(job -> job.cancel(true));
+        outgoingReRegisterJobs.clear();
+        outgoingSipClients.values().forEach(SipClient::dispose);
+        outgoingSipClients.clear();
+        outgoingRelays.values().forEach(SipBackchannelRtpRelay::stop);
+        outgoingRelays.clear();
+
+        stopSipBackchannelRelay();
+        configuredOutgoingExtensions = List.of();
+        sessionToClientId.clear();
+        backchannelSessionsByHttpSession.clear();
+        outgoingStreamNames.clear();
+        registrationState.clear();
+        updateState(CHANNEL_SIP_REGISTERED, UnDefType.UNDEF);
+        updateState(CHANNEL_SIP_CALL_STATE, UnDefType.UNDEF);
+    }
+
+    /**
+     * Detects the local IP address that can reach the VTO.
+     * Uses UDP socket connection (no actual data sent) to determine correct outbound interface.
+     *
+     * @param vtoHostname VTO hostname or IP address
+     * @return Local IP address as string
+     * @throws IOException if detection fails
+     */
+    private String detectLocalIp(String vtoHostname) throws IOException {
+        // Create a UDP socket and "connect" to VTO (doesn't actually send data)
+        // This makes the OS select the correct network interface
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.connect(InetAddress.getByName(vtoHostname), 5060);
+            String localIp = socket.getLocalAddress().getHostAddress();
+            logger.debug("Detected outbound IP for VTO {}: {}", vtoHostname, localIp);
+            return localIp;
+        }
+    }
+
+    private static boolean isValidPort(int port) {
+        return port > 0 && port <= 65535;
+    }
+
+    private boolean validateBackchannelPorts(DahuaDoorConfiguration cfg) {
+        List<String> extensions = parseSipExtensions(cfg.sipExtension);
+        boolean useWebRtcBackchannel = cfg.enableWebRTC;
+        boolean useSipBackchannel = cfg.enableSip && !extensions.isEmpty();
+        if (!useWebRtcBackchannel && !useSipBackchannel) {
+            return true;
+        }
+
+        int backchannelCount = useWebRtcBackchannel ? Math.max(1, extensions.size()) : extensions.size();
+        int backchannelBase = cfg.go2rtcApiPort + SIP_BACKCHANNEL_LISTEN_PORT_OFFSET;
+        int backchannelMax = backchannelBase + backchannelCount - 1;
+
+        if (!isValidPort(backchannelBase) || !isValidPort(backchannelMax)) {
+            String detail = String.format("Invalid backchannel port range %d-%d (go2rtcApiPort=%d, sipExtensions=%d)",
+                    backchannelBase, backchannelMax, cfg.go2rtcApiPort, extensions.size());
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR, detail);
+            logger.warn(detail);
+            return false;
+        }
+
+        if (useSipBackchannel) {
+            int sipBase = cfg.localSipPort;
+            int sipMax = sipBase + extensions.size() - 1;
+            if (!isValidPort(sipBase) || !isValidPort(sipMax)) {
+                String detail = String.format("Invalid SIP port range %d-%d (localSipPort=%d, sipExtensions=%d)",
+                        sipBase, sipMax, cfg.localSipPort, extensions.size());
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR, detail);
+                logger.warn(detail);
+                return false;
+            }
+
+            if (rangesOverlap(sipBase, sipMax, backchannelBase, backchannelMax)) {
+                String detail = String.format("SIP/backchannel port ranges overlap (sip=%d-%d, backchannel=%d-%d)",
+                        sipBase, sipMax, backchannelBase, backchannelMax);
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR, detail);
+                logger.warn(detail);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean rangesOverlap(int startA, int endA, int startB, int endB) {
+        return Math.max(startA, startB) <= Math.min(endA, endB);
+    }
+
+    private List<String> parseSipExtensions(String sipExtension) {
+        if (sipExtension.isBlank()) {
+            return List.of();
+        }
+
+        List<String> rawExtensions = Arrays.stream(sipExtension.split(",")).map(String::trim)
+                .filter(entry -> !entry.isBlank()).toList();
+
+        LinkedHashSet<String> uniqueExtensions = new LinkedHashSet<>(rawExtensions);
+        if (uniqueExtensions.size() < rawExtensions.size()) {
+            logger.warn("Duplicate sipExtension entries removed: {}", sipExtension);
+        }
+
+        List<String> limitedExtensions = uniqueExtensions.stream().limit(10).toList();
+        if (limitedExtensions.size() < uniqueExtensions.size()) {
+            logger.warn("sipExtension list capped at 10 entries");
+        }
+        return limitedExtensions;
+    }
+
+    private synchronized void updateRegistrationState(String extension, boolean success) {
+        registrationState.put(extension, success);
+
+        int expectedClients = outgoingSipClients.size();
+        boolean allRegistered = expectedClients > 0 && registrationState.size() >= expectedClients
+                && registrationState.entrySet().stream().filter(entry -> outgoingSipClients.containsKey(entry.getKey()))
+                        .allMatch(Map.Entry::getValue);
+
+        updateState(CHANNEL_SIP_REGISTERED, allRegistered ? OnOffType.ON : OnOffType.OFF);
+    }
+
+    // ============================================================================
+    // SipEventListener Implementation
+    // ============================================================================
+
+    @Override
+    public void onRegistrationSuccess() {
+        logger.debug("SIP registration successful");
+        updateAggregateSipCallState();
+    }
+
+    @Override
+    public void onRegistrationFailed(String reason) {
+        logger.warn("SIP registration failed: {}", reason);
+        updateAggregateSipCallState();
+    }
+
+    @Override
+    public void onInviteReceived(String callerId) {
+        logger.info("SIP INVITE received from {}", callerId);
+        if (!shouldProcessSipInvite("SIP")) {
+            return;
+        }
+        updateAggregateSipCallState();
+    }
+
+    @Override
+    public void onCallCancelled() {
+        logger.debug("SIP CANCEL received - transitioning call state to IDLE");
+        updateAggregateSipCallState();
+    }
+
+    @Override
+    public void onCallActive() {
+        logger.debug("SIP call is now ACTIVE (ACK received)");
+        updateAggregateSipCallState();
+    }
+
+    @Override
+    public void onCallTerminating() {
+        logger.debug("SIP call is TERMINATING");
+        updateAggregateSipCallState();
+    }
+
+    @Override
+    public void onCallEnded() {
+        logger.debug("SIP call ended, setting state to IDLE");
+        updateAggregateSipCallState();
+    }
+
+    public synchronized @Nullable String assignClientForSession(String sessionId) {
+        cleanupExpiredSessions();
+
+        List<String> availableClientIds = configuredOutgoingExtensions.stream().filter(outgoingSipClients::containsKey)
+                .toList();
+
+        if (availableClientIds.isEmpty()) {
+            return null;
+        }
+
+        @Nullable
+        String existingClientId = sessionToClientId.get(sessionId);
+        if (existingClientId != null && availableClientIds.contains(existingClientId)) {
+            updateBackchannelSession(sessionId, existingClientId, getSipClientForExtension(existingClientId));
+            return existingClientId;
+        }
+
+        Set<String> usedClientIds = new HashSet<>(sessionToClientId.values());
+        @Nullable
+        String activeIncomingClientId = findUnassignedActiveClientId(availableClientIds, usedClientIds);
+        if (activeIncomingClientId != null) {
+            sessionToClientId.put(sessionId, activeIncomingClientId);
+            SipClient activeClient = getSipClientForExtension(activeIncomingClientId);
+            logger.debug("Session {} assigned to active SipClient {} (state={})", sessionId, activeIncomingClientId,
+                    activeClient != null ? activeClient.getCallState() : "unknown");
+            updateBackchannelSession(sessionId, activeIncomingClientId, activeClient);
+            return activeIncomingClientId;
+        }
+
+        for (String clientId : availableClientIds) {
+            if (!usedClientIds.contains(clientId)) {
+                sessionToClientId.put(sessionId, clientId);
+                SipClient idleClient = getSipClientForExtension(clientId);
+                logger.debug("Session {} assigned to idle SipClient {} (state={})", sessionId, clientId,
+                        idleClient != null ? idleClient.getCallState() : "unknown");
+                updateBackchannelSession(sessionId, clientId, idleClient);
+                return clientId;
+            }
+        }
+
+        logger.debug("All {} outgoing extensions are occupied for session {}", availableClientIds.size(), sessionId);
+        return null;
+    }
+
+    private @Nullable SipClient getSipClientForExtension(String extensionOrClientId) {
+        return outgoingSipClients.get(extensionOrClientId);
+    }
+
+    private @Nullable String findUnassignedActiveClientId(List<String> availableClientIds, Set<String> usedClientIds) {
+        for (SipClient.SipCallState state : List.of(SipClient.SipCallState.RINGING, SipClient.SipCallState.ANSWERING,
+                SipClient.SipCallState.ACTIVE, SipClient.SipCallState.TERMINATING,
+                SipClient.SipCallState.OUTGOING_RINGING)) {
+            for (String clientId : availableClientIds) {
+                if (usedClientIds.contains(clientId)) {
+                    continue;
+                }
+                SipClient client = outgoingSipClients.get(clientId);
+                if (client != null && state.name().equals(client.getCallState())) {
+                    return clientId;
+                }
+            }
+        }
+        return null;
+    }
+
+    private void updateAggregateSipCallState() {
+        updateState(CHANNEL_SIP_CALL_STATE, new StringType(determineAggregateSipCallState().name()));
+    }
+
+    private SipClient.SipCallState determineAggregateSipCallState() {
+        List<SipClient.SipCallState> priority = List.of(SipClient.SipCallState.ACTIVE, SipClient.SipCallState.ANSWERING,
+                SipClient.SipCallState.OUTGOING_RINGING, SipClient.SipCallState.RINGING,
+                SipClient.SipCallState.TERMINATING, SipClient.SipCallState.HUNGUP, SipClient.SipCallState.IDLE);
+
+        for (SipClient.SipCallState state : priority) {
+            boolean hasState = outgoingSipClients.values().stream()
+                    .anyMatch(client -> state.name().equals(client.getCallState()));
+            if (hasState) {
+                return state;
+            }
+        }
+        return SipClient.SipCallState.IDLE;
+    }
+
+    public synchronized @Nullable String getAssignedClientForSession(String sessionId) {
+        cleanupExpiredSessions();
+        return sessionToClientId.get(sessionId);
+    }
+
+    public synchronized String getSipCallStateForSession(String sessionId) {
+        @Nullable
+        String clientId = sessionToClientId.get(sessionId);
+        if (clientId == null) {
+            clientId = assignClientForSession(sessionId);
+        }
+        if (clientId == null) {
+            return SipClient.SipCallState.IDLE.name();
+        }
+        @Nullable
+        SipClient client = getSipClientForExtension(clientId);
+        String state = client != null ? client.getCallState() : SipClient.SipCallState.IDLE.name();
+        updateBackchannelSession(sessionId, clientId, client);
+        logger.debug("SIP state request: sessionId={}, clientId={}, state={}", sessionId, clientId, state);
+        return state;
+    }
+
+    public synchronized @Nullable String getSipCallerForSession(String sessionId) {
+        @Nullable
+        String clientId = sessionToClientId.get(sessionId);
+        if (clientId == null) {
+            clientId = assignClientForSession(sessionId);
+        }
+        if (clientId == null) {
+            return null;
+        }
+        @Nullable
+        SipClient client = getSipClientForExtension(clientId);
+        updateBackchannelSession(sessionId, clientId, client);
+        logger.debug("SIP caller request: sessionId={}, clientId={}, hasClient={}", sessionId, clientId,
+                client != null);
+        return client != null ? client.getCurrentCallerId() : null;
+    }
+
+    public synchronized boolean answerSipCallForSession(String sessionId) {
+        @Nullable
+        String clientId = assignClientForSession(sessionId);
+        if (clientId == null) {
+            return false;
+        }
+        @Nullable
+        SipClient client = getSipClientForExtension(clientId);
+        if (client == null) {
+            logger.debug("SIP answer request: sessionId={}, clientId={} has no assigned client", sessionId, clientId);
+            return false;
+        }
+        boolean success = client.sendOkResponse();
+        updateBackchannelSession(sessionId, clientId, client);
+        logger.debug("SIP answer request: sessionId={}, clientId={}, success={}, state={}", sessionId, clientId,
+                success, client.getCallState());
+        updateAggregateSipCallState();
+        return success;
+    }
+
+    public synchronized boolean hangupSipCallForSession(String sessionId) {
+        @Nullable
+        String clientId = assignClientForSession(sessionId);
+        if (clientId == null) {
+            return false;
+        }
+        @Nullable
+        SipClient client = getSipClientForExtension(clientId);
+        if (client == null) {
+            logger.debug("SIP hangup request: sessionId={}, clientId={} has no assigned client", sessionId, clientId);
+            return false;
+        }
+        boolean success = client.sendBye("manual-ui");
+        updateBackchannelSession(sessionId, clientId, client);
+        logger.debug("SIP hangup request: sessionId={}, clientId={}, success={}, state={}", sessionId, clientId,
+                success, client.getCallState());
+        updateAggregateSipCallState();
+        return success;
+    }
+
+    public record OutgoingCallResult(boolean success, @Nullable String clientId, String callState) {
+    }
+
+    public synchronized OutgoingCallResult startOutgoingCallForSession(String sessionId, String target) {
+        @Nullable
+        String extension = assignClientForSession(sessionId);
+        if (extension == null) {
+            return new OutgoingCallResult(false, null, "NO_FREE_CLIENT");
+        }
+
+        SipClient client = getSipClientForExtension(extension);
+        if (client == null) {
+            logger.warn("No SIP client for extension {} (session {})", extension, sessionId);
+            return new OutgoingCallResult(false, extension, "UNAVAILABLE");
+        }
+
+        boolean sent = client.sendInvite(target);
+        if (sent) {
+            updateBackchannelSession(sessionId, extension, client);
+        }
+        updateAggregateSipCallState();
+        return new OutgoingCallResult(sent, extension, getSipCallStateForSession(sessionId));
+    }
+
+    public synchronized @Nullable String getWebRtcUrlForClientId(String clientId) {
+        String streamName = getWebRtcStreamNameForClientId(clientId);
+        if (streamName == null) {
+            return null;
+        }
+        return WEBRTC_SERVLET_PATH + "/" + streamName;
+    }
+
+    public synchronized @Nullable String getWebRtcStreamNameForClientId(String clientId) {
+        String streamName = outgoingStreamNames.get(clientId);
+        if (streamName != null) {
+            return streamName;
+        }
+
+        Go2RtcManager localManager = go2rtcManager;
+        if (localManager == null) {
+            return null;
+        }
+        return localManager.getStreamName();
+    }
+
+    public synchronized @Nullable String allocateWebRtcStreamNameForClientId(String clientId) {
+        return getWebRtcStreamNameForClientId(clientId);
+    }
+
+    public synchronized @Nullable String getOrAllocateWebRtcStreamNameForSession(String sessionId, String clientId) {
+        return allocateWebRtcStreamNameForClientId(clientId);
+    }
+
+    public synchronized int getRelayListenPortForClientId(String clientId) {
+        SipBackchannelRtpRelay relay = outgoingRelays.get(clientId);
+        return relay != null ? relay.getListenPort() : -1;
+    }
+
+    public synchronized @Nullable SipBackchannelSession getSipBackchannelSessionForSession(String sessionId) {
+        cleanupExpiredSessions();
+        return backchannelSessionsByHttpSession.get(sessionId);
+    }
+
+    private synchronized void cleanupExpiredSessions() {
+        long now = System.currentTimeMillis();
+
+        backchannelSessionsByHttpSession.entrySet()
+                .removeIf(entry -> now - entry.getValue().getUpdatedAtMs() > SESSION_TTL_MS);
+
+        sessionToClientId.keySet().removeIf(sessionId -> !backchannelSessionsByHttpSession.containsKey(sessionId));
+
+        while (backchannelSessionsByHttpSession.size() > MAX_SESSION_MAPPINGS) {
+            @Nullable
+            String oldestSessionId = null;
+            long oldestUpdatedAt = Long.MAX_VALUE;
+
+            for (Map.Entry<String, SipBackchannelSession> entry : backchannelSessionsByHttpSession.entrySet()) {
+                long updatedAt = entry.getValue().getUpdatedAtMs();
+                if (updatedAt < oldestUpdatedAt) {
+                    oldestUpdatedAt = updatedAt;
+                    oldestSessionId = entry.getKey();
+                }
+            }
+
+            if (oldestSessionId == null) {
+                break;
+            }
+
+            backchannelSessionsByHttpSession.remove(oldestSessionId);
+            sessionToClientId.remove(oldestSessionId);
+        }
+    }
+
+    private void updateBackchannelSession(String sessionId, String clientId, @Nullable SipClient client) {
+        SipBackchannelSession current = backchannelSessionsByHttpSession.get(sessionId);
+        long now = System.currentTimeMillis();
+
+        String callerId = current != null ? current.getCallerId() : "";
+        String callState = current != null ? current.getCallState() : SipClient.SipCallState.IDLE.name();
+        @Nullable
+        String inviteSdp = current != null ? current.getInviteSdp() : null;
+        long createdAtMs = current != null ? current.getCreatedAtMs() : now;
+
+        if (client != null) {
+            callState = client.getCallState();
+
+            @Nullable
+            String currentCallerId = client.getCurrentCallerId();
+            if (currentCallerId != null) {
+                callerId = currentCallerId;
+            }
+
+            inviteSdp = client.getCurrentInviteSdp();
+        }
+
+        backchannelSessionsByHttpSession.put(sessionId, new SipBackchannelSession(sessionId, clientId,
+                getThing().getUID().toString(), callerId, callState, inviteSdp, createdAtMs, now));
+
+        cleanupExpiredSessions();
+    }
+
+    private class PooledSipAdapter implements SipEventListener {
+        private final String extension;
+
+        private PooledSipAdapter(String extension) {
+            this.extension = extension;
+        }
+
+        @Override
+        public void onRegistrationSuccess() {
+            logger.debug("Outgoing SIP {} registered", extension);
+            updateRegistrationState(extension, true);
+        }
+
+        @Override
+        public void onRegistrationFailed(String reason) {
+            logger.warn("Outgoing SIP {} registration failed: {}", extension, reason);
+            updateRegistrationState(extension, false);
+        }
+
+        @Override
+        public void onInviteReceived(String callerId) {
+            logger.info("SIP {} received incoming call from {}", extension, callerId);
+            if (shouldProcessSipInvite("SIP " + extension)) {
+                updateAggregateSipCallState();
+            }
+        }
+
+        @Override
+        public void onCallCancelled() {
+            logger.debug("SIP {} call cancelled", extension);
+            updateAggregateSipCallState();
+        }
+
+        @Override
+        public void onCallActive() {
+            logger.debug("SIP {} call active", extension);
+            updateAggregateSipCallState();
+        }
+
+        @Override
+        public void onCallTerminating() {
+            logger.debug("SIP {} call terminating", extension);
+            updateAggregateSipCallState();
+        }
+
+        @Override
+        public void onCallEnded() {
+            logger.debug("SIP {} call ended", extension);
+            updateAggregateSipCallState();
+        }
+    }
 }

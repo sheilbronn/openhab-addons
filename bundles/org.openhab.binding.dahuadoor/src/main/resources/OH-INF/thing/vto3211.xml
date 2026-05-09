@@ -117,7 +117,10 @@
 			</parameter>
 			<parameter name="sipExtension" type="text">
 				<label>SIP Extension</label>
-				<description>SIP extension to register as (e.g., 9901#2). Also used as SIP username for authentication. Only used
+				<description>Comma-separated list of SIP extensions to register as, e.g. "9901#2,9901#3". Each
+					extension is used as
+					its own SIP username and may handle one browser/SIP session in parallel.
+					A single value is also allowed. Only used
 					when Enable SIP Client is on.</description>
 				<default></default>
 			</parameter>
@@ -129,9 +132,9 @@
 			</parameter>
 			<parameter name="localSipPort" type="integer">
 				<label>Local SIP Port</label>
-				<description>Local UDP port for SIP client (default 5062). Must be unique per thing if multiple SIP clients are
+				<description>Local UDP port for SIP client (default 5060). Must be unique per thing if multiple SIP clients are
 					used.</description>
-				<default>5062</default>
+				<default>5060</default>
 			</parameter>
 			<parameter name="sipRealm" type="text">
 				<label>SIP Realm</label>

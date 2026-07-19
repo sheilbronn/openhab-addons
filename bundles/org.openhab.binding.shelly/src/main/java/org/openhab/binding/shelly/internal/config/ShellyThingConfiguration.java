@@ -17,10 +17,19 @@ import org.eclipse.jdt.annotation.NonNullByDefault;
 /**
  * The {@link ShellyThingConfiguration} class contains fields mapping thing configuration parameters.
  *
+ * Per-thing configuration mapped from the <config-description> in thing-types.xml.
+ * Getters are provided for all fields. Never access DTO fields directly from outside the config layer.
+ *
  * @author Markus Michels - Initial contribution
  */
 @NonNullByDefault
 public class ShellyThingConfiguration {
+    /*
+     * deviceIp vs. deviceAddress - serve different purposes:
+     * deviceIp: IP address, hostname, or host:port
+     * deviceAddress: BLU devices only - Bluetooth Device Address
+     */
+
     private String deviceIp = ""; // IP address of the device
     private String deviceAddress = ""; // IP address or MAC address for BLU devices
     private String userId = ""; // userid for http basic auth
@@ -33,13 +42,12 @@ public class ShellyThingConfiguration {
     private int favoriteUP = 0; // Roller position favorite when control channel receives ON, 0=none
     private int favoriteDOWN = 0; // Roller position favorite when control channel receives OFF, 0=none
 
-    // Gen1
-    private boolean eventsButton = false; // true: register for Relay btn_xxx events
+    private boolean eventsButton; // true: register for Relay btn_xxx events
     private boolean eventsSwitch = true; // true: register for device out_xxx events
     private boolean eventsPush = true; // true: register for short/long push events
     private boolean eventsRoller = true; // true: register for short/long push events
     private boolean eventsSensorReport = true; // true: register for sensor events
-    private boolean eventsCoIoT = false; // true: use CoIoT events (based on COAP)
+    private boolean eventsCoIoT; // true: use CoIoT events (based on COAP)
 
     // Gen2
     private Boolean enableBluGateway = false;
